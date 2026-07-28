@@ -12,14 +12,14 @@ No GUI is launched. Safe to run over SSH or in scripts.
 """
 
 import sys
+import re as _re
 
-from brain import get_vibe_params, get_playlist_vibe_params
+from brain import get_vibe_params, get_playlist_vibe_params, get_continue_params
 from config import is_configured, load_config
 from spotify_client import SpotifyClient
 
 # ------------------------------------------------------------------
-# Colour helpers (auto-disabled when output is not a terminal,
-# e.g. when piped into a script or log file)
+# Colour helpers (auto-disabled when output is not a terminal)
 # ------------------------------------------------------------------
 if sys.stdout.isatty():
     _RESET  = "\033[0m"
@@ -31,17 +31,13 @@ if sys.stdout.isatty():
 else:
     _RESET = _BOLD = _GREEN = _YELLOW = _RED = _CYAN = ""
 
-
 def _info(msg: str)    -> None: print(f"{_CYAN}{_BOLD}[*]{_RESET} {msg}")
 def _success(msg: str) -> None: print(f"{_GREEN}{_BOLD}[+]{_RESET} {msg}")
 def _warn(msg: str)    -> None: print(f"{_YELLOW}{_BOLD}[!]{_RESET} {msg}")
 def _error(msg: str)   -> None: print(f"{_RED}{_BOLD}[x]{_RESET} {msg}")
 
-
-# Persists between CLI calls within the same process (i.e. not between
-# separate dj invocations — use the GUI for multi-session continue).
+# Persists between CLI calls within the same process
 _cli_spotify_client: SpotifyClient | None = None
-
 
 def _get_cli_client() -> SpotifyClient:
     global _cli_spotify_client
@@ -51,23 +47,13 @@ def _get_cli_client() -> SpotifyClient:
 
 
 def run_cli(request: str, is_continue: bool = False) -> int:
-    """
-    Execute a music request from the terminal.
-
-    Args:
-        request:     Natural language music request, e.g. "dark techno"
-        is_continue: If True, generate fresh queries that avoid previous ones
-
-    Returns:
-        Exit code - 0 for success, 1 for any error.
-    """
     if not is_configured():
         _error("No Gemini API key found.")
         _warn(
             "Run the app in GUI mode first to complete setup:\n"
-            "    python main.py\n"
+            "  python main.py\n"
             "Or set your key directly:\n"
-            "    python main.py --set-key YOUR_KEY_HERE"
+            "  python main.py --set-key YOUR_KEY_HERE"
         )
         return 1
 
@@ -76,25 +62,34 @@ def run_cli(request: str, is_continue: bool = False) -> int:
     local_only = config.get("local_ai_only", False)
     client     = _get_cli_client()
 
-    import re as _re
     playlist_url = _re.search(
         r"(https?://open\.spotify\.com/playlist/[A-Za-z0-9]+|spotify:playlist:[A-Za-z0-9]+)",
         request or ""
     )
 
-    # Step 1 - AI generates search queries
+    # STEP 0: Fetch user's top artists/genres for playlist context
+    user_taste = client.get_user_top_artists_and_genres()
+    playlist_context = user_taste.get("artists", []) + user_taste.get("genres", [])
+
+    # STEP 1: AI generates search queries
     if is_continue:
         if not client.last_request:
             _error("Nothing playing yet — run a normal request first.")
             return 1
         _info(f'Continuing: "{client.last_request}"')
         try:
-            from brain import get_continue_params
-            directives = get_continue_params(client.last_request, client.last_queries, api_key, local_only=local_only)
+            directives = get_continue_params(
+                client.last_request, 
+                client.last_queries, 
+                api_key, 
+                local_only=local_only,
+                playlist_context=playlist_context
+            )
         except Exception as e:
             _error(f"AI error: {e}")
             return 1
         playlist_tracks = None
+
     elif playlist_url:
         _info("Playlist URL detected — fetching tracks...")
         try:
@@ -106,16 +101,23 @@ def run_cli(request: str, is_continue: bool = False) -> int:
         user_intent = _re.sub(r"https?://\S+|spotify:\S+", "", request).strip()
         client.last_request = request
         try:
-            directives = get_playlist_vibe_params(playlist_tracks, user_intent, api_key, local_only=local_only)
+            directives = get_playlist_vibe_params(
+                playlist_tracks, user_intent, api_key, local_only=local_only,
+                playlist_context=playlist_context
+            )
         except Exception as e:
             _error(f"AI error: {e}")
             return 1
+
     else:
         playlist_tracks = None
         _info(f'Request: "{request}"')
         client.last_request = request
         try:
-            directives = get_vibe_params(request, api_key, local_only=local_only)
+            directives = get_vibe_params(
+                request, api_key, local_only=local_only,
+                playlist_context=playlist_context
+            )
         except Exception as e:
             _error(f"AI error: {e}")
             return 1
@@ -124,12 +126,19 @@ def run_cli(request: str, is_continue: bool = False) -> int:
     _info(f"Queries ({len(directives.queries)}): {directives.queries}")
     _info(f"Target queue: {directives.queue_size} tracks")
 
-    # Step 2 - Search Spotify and start playback
+    # STEP 1.5: Process seed_artists if provided by the AI
+    extra_tracks = []
+    if hasattr(directives, "seed_artists") and directives.seed_artists:
+        _info(f"AI provided seed artists: {directives.seed_artists}")
+        _info("Fetching related artists from Spotify's graph...")
+        extra_tracks = client.get_related_artist_tracks(directives.seed_artists, max_tracks=40)
+
+    # STEP 2: Search Spotify and start playback
     try:
         if playlist_tracks is not None:
-            result = client.search_and_play_mixed(playlist_tracks, directives)
+            result = client.search_and_play_mixed(playlist_tracks, directives, extra_tracks=extra_tracks)
         else:
-            result = client.search_and_play(directives)
+            result = client.search_and_play(directives, extra_tracks=extra_tracks)
     except Exception as e:
         _error(f"Spotify error: {e}")
         return 1
@@ -142,12 +151,7 @@ def run_cli(request: str, is_continue: bool = False) -> int:
         _error(result.message)
         return 1
 
-
 def run_set_key(key: str) -> int:
-    """
-    Save a Gemini API key from the command line without opening the GUI.
-    Called when the user runs:  python main.py --set-key AIza...
-    """
     from config import save_config
     key = key.strip()
     if len(key) < 20:
@@ -157,13 +161,11 @@ def run_set_key(key: str) -> int:
     config["gemini_api_key"] = key
     save_config(config)
     _success("Gemini API key saved.")
-    _info("You can now use the CLI:  dj \"your request\"")
+    _info('You can now use the CLI: dj "your request"')
     return 0
 
-
 def print_help() -> None:
-    """Print CLI usage information."""
-    print(f"""
+    print(f"""\
 {_BOLD}Spotify AI DJ{_RESET}
 
 {_BOLD}GUI mode{_RESET} (no arguments):
@@ -172,17 +174,11 @@ def print_help() -> None:
 
 {_BOLD}CLI mode{_RESET} (play immediately from terminal):
   dj "dark techno"
-  dj "relaxing lo-fi for studying"
   python main.py "90s hip hop"
 
-{_BOLD}Continue playing (fresh tracks, same vibe){_RESET}:
+{_BOLD}Continue playing{_RESET} (fresh tracks, same vibe):
   dj --continue
 
-{_BOLD}First-time setup from terminal{_RESET} (skips the GUI setup screen):
+{_BOLD}First-time setup from terminal{_RESET}:
   python main.py --set-key YOUR_GEMINI_API_KEY
-  dj --set-key YOUR_GEMINI_API_KEY
-
-{_BOLD}Options{_RESET}:
-  --set-key KEY   Save a Gemini API key without opening the GUI
-  --help, -h      Show this message
 """)
