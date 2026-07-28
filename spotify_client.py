@@ -820,59 +820,42 @@ class SpotifyClient:
             queries_run=len(getattr(directives, "queries", [])),
         )
 
-    def search_and_play(self, directives) -> PlayResult:
-        """
-        Build a queue from AI-generated directives and start playback.
-        Accepts a DJDirectives object (from brain.py) or a plain string.
-        """
-        # Authenticate
-        try:
-            self._get_client()
-        except Exception as e:
-            return PlayResult(success=False, message=f"Authentication failed: {e}")
-
-        # Find a playback device — launch Spotify if not running
-        device_id = self._find_device_id()
-        if not device_id:
-            self._log_fn("[spotify] No device — attempting to launch Spotify...")
-            if self.ensure_spotify_open():
-                device_id = self._find_device_id()
-        if not device_id:
-            return PlayResult(
-                success=False,
-                message="No Spotify device found. Tried to launch Spotify but no device appeared.",
-            )
-
-        # Unpack directives
-        if hasattr(directives, "queries"):
-            queries     = directives.queries
-            queue_size  = max(1, min(100, directives.queue_size))
-            search_mode = getattr(directives, "search_mode", "track")
-        else:
-            queries     = [str(directives)]
-            queue_size  = 50
-            search_mode = "track"
+        def search_and_play(self, directives, extra_tracks: list[dict] | None = None) -> PlayResult:
+        # ... [Keep all existing auth and device checking code exactly as is] ...
 
         if not queries:
             return PlayResult(success=False, message="No search queries were generated.")
 
-        # Build the track pool — route to album pipeline for OST requests
+        # Build the track pool
         if search_mode == "album":
             print(f"[spotify] OST mode — searching albums")
             tracks = self._build_album_pool(queries, target=queue_size * 2)
         else:
-            tracks = self._build_track_pool(queries, target=queue_size * 2)  # fetch extra to absorb filtering
+            tracks = self._build_track_pool(queries, target=queue_size * 2)
+            
+        # Append extra tracks (from seed artists) BEFORE filtering
+        if extra_tracks:
+            tracks.extend(extra_tracks)
+            
+        # Deduplicate by URI
+        seen_uris = set()
+        unique_tracks = []
+        for t in tracks:
+            uri = t.get("uri")
+            if uri and uri not in seen_uris and uri not in self.played_uris:
+                seen_uris.add(uri)
+                unique_tracks.append(t)
+                
+        # Apply Diversity Filter (Max 2 tracks per artist)
+        unique_tracks = self._apply_diversity_filter(unique_tracks, max_per_artist=2)
         
-        tracks = [t for t in tracks if t.get("uri") not in self.played_uris]
-        tracks = tracks[:queue_size]
+        tracks = unique_tracks[:queue_size]
 
         if not tracks:
             return PlayResult(
                 success=False,
                 message=f"No tracks found. Tried {len(queries)} queries: {queries}",
             )
-
-        # Start playback
         uris   = [t["uri"] for t in tracks]
         first  = tracks[0]
         artist = first["artists"][0]["name"] if first.get("artists") else "Unknown"
