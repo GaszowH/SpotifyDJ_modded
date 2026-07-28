@@ -750,7 +750,7 @@ class SpotifyAIDJWindow(Gtk.ApplicationWindow):
         self._set_busy(True)
         threading.Thread(target=self._play_worker, args=(self._spotify.last_request, True), daemon=True).start()
 
-    def _play_worker(self, request: str, is_continue: bool = False) -> None:
+        def _play_worker(self, request: str, is_continue: bool = False) -> None:
         """Background thread: AI query then Spotify playback."""
         if is_continue:
             self._log(f'Continuing: "{request}"')
@@ -761,14 +761,17 @@ class SpotifyAIDJWindow(Gtk.ApplicationWindow):
             config     = load_config()
             api_key    = config.get("gemini_api_key", "")
             local_only = config.get("local_ai_only", False)
+            
+            # Fetch user taste context
+            user_taste = self._spotify.get_user_top_artists_and_genres()
+            playlist_context = user_taste.get("artists", []) + user_taste.get("genres", [])
 
-            # Detect playlist URL in request
             import re as _re
             playlist_url = _re.search(
                 r"(https?://open\.spotify\.com/playlist/[A-Za-z0-9]+|spotify:playlist:[A-Za-z0-9]+)",
                 request
             )
-
+            
             if is_continue:
                 from brain import get_continue_params
                 queue_tracks = self._spotify.get_queue()
@@ -780,8 +783,10 @@ class SpotifyAIDJWindow(Gtk.ApplicationWindow):
                     api_key,
                     local_only=local_only,
                     queue_tracks=queue_tracks,
+                    playlist_context=playlist_context
                 )
                 playlist_tracks = None
+                
             elif playlist_url:
                 self._log("Playlist detected — fetching tracks...")
                 try:
@@ -790,24 +795,39 @@ class SpotifyAIDJWindow(Gtk.ApplicationWindow):
                 except Exception as e:
                     GLib.idle_add(self._finish_worker, f"Playlist error: {e}", False)
                     return
-                # Strip the URL from the prompt so the AI sees only the user's intent
+                    
                 user_intent = _re.sub(r"https?://\S+|spotify:\S+", "", request).strip()
                 directives = get_playlist_vibe_params(
-                    playlist_tracks, user_intent, api_key, local_only=local_only
+                    playlist_tracks, user_intent, api_key, local_only=local_only,
+                    playlist_context=playlist_context
                 )
                 self._log(f"AI: {directives.reasoning}")
                 self._log(f"Running {len(directives.queries)} searches for similar tracks...")
+                
             else:
                 playlist_tracks = None
-                directives = get_vibe_params(request, api_key, local_only=local_only)
+                directives = get_vibe_params(
+                    request, api_key, local_only=local_only,
+                    playlist_context=playlist_context
+                )
                 self._log(f"AI: {directives.reasoning}")
                 self._log(f"Running {len(directives.queries)} searches, targeting {directives.queue_size} tracks...")
+
         except Exception as e:
             GLib.idle_add(self._finish_worker, f"AI error: {e}", False)
             return
 
+        # Process seed artists if provided
+        extra_tracks = []
+        if hasattr(directives, "seed_artists") and directives.seed_artists:
+            self._log(f"AI provided seed artists: {directives.seed_artists}. Fetching related tracks...")
+            extra_tracks = self._spotify.get_related_artist_tracks(directives.seed_artists, max_tracks=40)
+
         try:
-            result = self._spotify.search_and_play(directives)
+            if playlist_tracks is not None:
+                result = self._spotify.search_and_play_mixed(playlist_tracks, directives, extra_tracks=extra_tracks)
+            else:
+                result = self._spotify.search_and_play(directives, extra_tracks=extra_tracks)
         except Exception as e:
             GLib.idle_add(self._finish_worker, f"Spotify error: {e}", False)
             return
