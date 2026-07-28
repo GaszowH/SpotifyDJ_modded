@@ -139,7 +139,28 @@ class SpotifyClient:
     Wrapper around spotipy for authentication and playback.
     OAuth runs lazily on the first call and is cached to disk.
     """
-
+        def _apply_diversity_filter(self, tracks: list[dict], max_per_artist: int = 2) -> list[dict]:
+        """
+        Caps the queue at max_per_artist tracks per artist to prevent 
+        any single artist (like Tymek) from taking over the queue.
+        """
+        artist_counts = {}
+        filtered_tracks = []
+        for track in tracks:
+            artists = track.get("artists", [])
+            if not artists:
+                filtered_tracks.append(track)
+                continue
+            
+            # Use the first artist's ID or name as the key
+            artist_key = artists[0].get("id") or artists[0].get("name", "Unknown").lower()
+            
+            count = artist_counts.get(artist_key, 0)
+            if count < max_per_artist:
+                filtered_tracks.append(track)
+                artist_counts[artist_key] = count + 1
+                
+        return filtered_tracks
     def __init__(self):
         self._sp: Optional[spotipy.Spotify] = None
         # Session state - persists between plays for continue functionality
