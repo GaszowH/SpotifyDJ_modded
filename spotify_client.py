@@ -603,7 +603,6 @@ class SpotifyClient:
         being sent as explicit params which Spotify rejects with 403.
         Handles pagination automatically for large playlists.
         """
-        import re
         match = re.search(r"playlist[/:]([A-Za-z0-9]+)", playlist_url)
         if not match:
             raise ValueError(f"Could not extract playlist ID from: {playlist_url!r}")
@@ -633,6 +632,100 @@ class SpotifyClient:
         print(f"[spotify] Fetched {len(tracks)} tracks from playlist {playlist_id}")
         return tracks
 
+    def get_user_top_artists_and_genres(self) -> dict:
+        """
+        Fetch the user's top artists and extract their genres.
+        Returns a dict with 'artists' (list of names) and 'genres' (list of unique genres).
+        This output can be passed directly to brain.py as the `playlist_context` parameter.
+        """
+        try:
+            sp = self._get_client()
+            top_artists = sp.current_user_top_artists(limit=15, time_range='medium_term')
+            artists = []
+            genres = set()
+            for item in top_artists.get("items", []):
+                name = item.get("name", "")
+                if name:
+                    artists.append(name)
+                for genre in item.get("genres", []):
+                    genres.add(genre)
+            return {
+                "artists": artists,
+                "genres": list(genres)
+            }
+        except Exception as e:
+            print(f"[spotify] get_user_top_artists_and_genres error: {e}")
+            return {"artists": [], "genres": []}
+
+    def get_related_artist_tracks(self, seed_artists: list[str], max_tracks: int = 50) -> list[dict]:
+        """
+        Discover new tracks based on seed artists using Spotify's Related Artists API.
+        For each seed artist:
+          1. Search for the artist to get their Spotify ID.
+          2. Fetch related artists.
+          3. Fetch top tracks from those related artists.
+        Deduplicates by URI and returns a shuffled list of tracks.
+        """
+        if not seed_artists:
+            return []
+
+        sp = self._get_client()
+        all_tracks = []
+        seen_uris = set()
+
+        for seed in seed_artists:
+            try:
+                # 1. Search for the artist
+                search_result = sp.search(q=seed, type='artist', limit=1)
+                artist_items = search_result.get('artists', {}).get('items', [])
+                if not artist_items:
+                    print(f"[spotify] No artist found for seed: '{seed}'")
+                    continue
+                
+                artist_id = artist_items[0]['id']
+                artist_name = artist_items[0]['name']
+                print(f"[spotify] Found seed artist: '{artist_name}' ({artist_id})")
+
+                # 2. Get related artists
+                related = sp.artist_related_artists(artist_id)
+                related_artists = related.get('artists', [])
+                
+                # Limit to top 5 related artists per seed to avoid API spam and keep it focused
+                for rel_artist in related_artists[:5]:
+                    rel_id = rel_artist['id']
+                    rel_name = rel_artist['name']
+                    
+                    # 3. Get top tracks for related artist
+                    try:
+                        # country is required by Spotify API, 'US' is a safe default fallback
+                        top_tracks = sp.artist_top_tracks(rel_id, country='US')
+                        tracks = top_tracks.get('tracks', [])
+                        
+                        # Take top 2 tracks per related artist to ensure variety across seeds
+                        for track in tracks[:2]:
+                            uri = track.get('uri')
+                            if uri and uri not in seen_uris:
+                                seen_uris.add(uri)
+                                # Normalize to match track pool format used elsewhere in this file
+                                normalized_track = {
+                                    "id": track.get("id"),
+                                    "uri": uri,
+                                    "name": track.get("name"),
+                                    "artists": track.get("artists", []),
+                                    "album": track.get("album", {}),
+                                    "discovered_via": f"related to {artist_name} -> {rel_name}"
+                                }
+                                all_tracks.append(normalized_track)
+                    except Exception as e:
+                        print(f"[spotify] Error fetching top tracks for {rel_name}: {e}")
+                        
+            except Exception as e:
+                print(f"[spotify] Error processing seed artist '{seed}': {e}")
+
+        print(f"[spotify] Discovered {len(all_tracks)} unique tracks from related artists")
+        random.shuffle(all_tracks)
+        return all_tracks[:max_tracks]
+
     def search_and_play_mixed(
         self,
         playlist_tracks: list[dict],
@@ -644,8 +737,6 @@ class SpotifyClient:
         mix_ratio: fraction of queue from the playlist (0.5 = 50/50).
         Tracks are interleaved so playlist and discovered songs alternate.
         """
-        import random
-
         queue_size = max(1, min(200, getattr(directives, "queue_size", 50)))
         n_playlist = int(queue_size * mix_ratio)
         n_search   = queue_size - n_playlist
@@ -750,6 +841,7 @@ class SpotifyClient:
             tracks = self._build_album_pool(queries, target=queue_size * 2)
         else:
             tracks = self._build_track_pool(queries, target=queue_size * 2)  # fetch extra to absorb filtering
+        
         tracks = [t for t in tracks if t.get("uri") not in self.played_uris]
         tracks = tracks[:queue_size]
 
@@ -789,11 +881,3 @@ class SpotifyClient:
             track_count=len(tracks),
             queries_run=len(queries),
         )
-
-# if i get one more http 400 i will actually fucking crash out dude 20:20 feb 18
-# oh the issue was I was making the API call wrong... whoops, works fine now, still collects only 10 raw tracks per request 20:26
-# this will probably be frowned upon by I used claude to add a bunch of GUI specific stuff and media playback. Code might now look different here than everyone else. Oh well
-
-# tracking playback is ehhh work in progress, since it's not available via spotify I need to do it locally. Noted, do not ask AI to do a thing you can do yourself
-
-# I have added a feature which SHOULD work that will allow you to paste a link and ask for "similar music" it accepts playlists and artists
