@@ -2,7 +2,8 @@
 brain.py
 --------
 Converts a natural language music request into multiple targeted Spotify
-search queries.
+search queries, with a strong emphasis on deep discovery, lateral moves 
+based on playlist history, and finding artists outside the LLM's memory.
 
 AI fallback chain (tried in order):
   1. Google Gemini (cloud) — fast, free tier
@@ -14,10 +15,10 @@ Configure the local LLM by adding these to your .env file:
   LOCAL_LLM_MODEL=llama3.2:latest                 # Model name as shown in Open WebUI
 
 Two public functions:
-  get_vibe_params(user_prompt, api_key)
+  get_vibe_params(user_prompt, api_key, playlist_context=None)
       -> DJDirectives for a fresh request
 
-  get_continue_params(original_prompt, previous_queries, api_key)
+  get_continue_params(original_prompt, previous_queries, api_key, playlist_context=None)
       -> DJDirectives with fresh angles, avoiding the previous queries
 """
 
@@ -27,6 +28,7 @@ from preferences import build_preference_context, load_preferences
 
 import json
 import os
+import random
 from pathlib import Path
 
 from google import genai
@@ -74,67 +76,69 @@ LOCAL_LLM_MODEL    = _ENV.get("LOCAL_LLM_MODEL",    os.environ.get("LOCAL_LLM_MO
 
 INITIAL_PROMPT = """
 You are an expert music curator powering a Spotify AI DJ. Your job is to
-generate search queries that find great, specific tracks on Spotify.
+generate search queries and seed artists that find incredible, specific, and
+often undiscovered tracks on Spotify.
 
 User Request: "{user_prompt}"
 
----
-CRITICAL RULES FOR GOOD QUERIES:
+{playlist_context_block}
 
-1. BE SPECIFIC. Vague queries like "dark metal aggressive" return poor results.
+---
+CRITICAL RULES FOR GOOD QUERIES & DISCOVERY:
+
+1. DEEP DISCOVERY & OBSCURE ARTISTS: The user wants to find artists they would
+   NEVER normally have discovered. Do not just recommend mainstream or obvious
+   choices. Dig into underground scenes, micro-genres, regional movements,
+   independent labels, and hyper-specific niches.
+   
+2. BEYOND LLM MEMORY (SPOTIFY GRAPH): You may not know every obscure artist.
+   To solve this, provide 3-5 real, somewhat niche "seed artists" in the 
+   `seed_artists` field. The system will feed these to Spotify's "Related Artists" 
+   API, which will surface brand new artists outside your training data.
+
+3. BE SPECIFIC. Vague queries like "dark metal aggressive" return poor results.
    Real artist names, song titles, and known genre terms find real tracks.
 
-2. USE REAL ARTIST NAMES as your primary strategy. Spotify indexes artists,
-   albums, and song titles extremely well across all languages and scripts.
-
-3. NON-ENGLISH & NICHE GENRES — this is critical:
+4. NON-ENGLISH & NICHE GENRES — this is critical:
    - Search in the ORIGINAL LANGUAGE when relevant. Spotify indexes Cyrillic,
      Chinese, Arabic, Japanese etc. natively. "Любэ" finds more than "Lyube".
    - Also include transliterated versions as separate queries for safety.
    - For regional/folk/cultural music, name the specific tradition, region,
-     or movement. "Soviet military choir", "красная армия хор" (Red Army Choir),
-     "Russian romance", "shanson russe" etc.
-   - For political/historical music genres, treat them as cultural categories
-     and search for the actual artists and labels in that space.
+     or movement. "Soviet military choir", "красная армия хор", "Russian romance".
    - KNOW YOUR SCENES: if someone references a specific song or artist,
      identify the genre/scene they belong to and find related artists in it.
 
-4. MIX STRATEGIES across your queries:
+5. PLAYLIST INFLUENCE (If provided): 
+   - The user's existing taste is provided above. 
+   - DO NOT just recommend more of the same. Use it as a compass to point 
+     towards adjacent, unexplored, or contrasting scenes. 
+   - Example: If they listen to mainstream pop, suggest underground synth-pop 
+     from specific regions. If they like metal, suggest obscure folk-metal from 
+     specific countries. Lateral moves, not straight lines.
+
+6. MIX STRATEGIES across your queries:
    - Direct artist names (most reliable): "Ансамбль Александрова"
    - Original-script searches:           "Любэ", "Красная армия"
    - Transliterated versions:            "Lyube", "Krasnaya Armiya"
    - Genre/scene terms:                  "Soviet military songs", "военные песни"
    - Era or movement:                    "советские песни", "WWII Soviet"
-   - Related artists you know:           name actual artists in the genre
 
-5. QUANTITY: Generate 6-10 queries. For niche genres, use more queries
+7. QUANTITY: Generate 6-10 queries. For niche genres, use more queries
    since individual searches may return fewer results.
 
-6. REQUEST ALWAYS WINS. If the user asks for jazz, play jazz — even if their
-   history is all metal. The listener history below is only a tiebreaker for
-   vague requests. Never let it override an explicit genre, artist, or mood.
+8. REQUEST ALWAYS WINS. If the user asks for jazz, play jazz — even if their
+   history is all metal. The listener history/playlist is only a tiebreaker 
+   or a launching pad for vague requests. Never let it override an explicit 
+   genre, artist, or mood.
 
-7. SOUNDTRACKS, SCORES & GAME OSTs — this is critical:
+9. SOUNDTRACKS, SCORES & GAME OSTs — this is critical:
    NEVER search for a film/game title as a standalone query. "Destiny" returns
    songs NAMED Destiny, not the game. "Interstellar" returns a country singer.
-
-   USE SPOTIFY FIELD OPERATORS for precision. These filter by exact field:
-     artist:"Martin O'Donnell"              — only tracks by this artist
-     album:"Destiny Original Soundtrack"    — only tracks from this album
-     artist:"Hans Zimmer" album:"Inception" — both filters at once
+   USE SPOTIFY FIELD OPERATORS for precision. 
+     artist:"Martin O'Donnell"
+     album:"Destiny Original Soundtrack"
    Always prefer field operator queries over plain keyword queries for OSTs.
-
-   Also use plain queries as backup:
-   - Composer name alone: "Martin O'Donnell", "Mick Gordon"
-   - Composer + property: "Mick Gordon Doom"
-
-   Know your composers. Common ones:
-     Video games: Martin O'Donnell (Halo/Destiny), Mick Gordon (Doom/Wolfenstein),
-       Nobuo Uematsu (Final Fantasy), Koji Kondo (Mario/Zelda), Jesper Kyd (Assassin's Creed),
-       Gustavo Santaolalla (The Last of Us), Bear McCreary (God of War),
-       Yoko Shimomura (Kingdom Hearts), Disasterpeace (Celeste/Hyper Light Drifter)
-     Film: Hans Zimmer, John Williams, Ennio Morricone, Howard Shore, Bernard Herrmann
-     TV: Ramin Djawadi (Game of Thrones), Jeff Russo, Nathan Johnson
+   Set search_mode to "album" for OST requests.
 
 QUEUE SIZE:
   - Casual listen:      20-30 tracks
@@ -147,80 +151,22 @@ QUEUE SIZE:
 EXAMPLES:
 
 Request: "industrial metal like rammstein"
-reasoning: "Mix direct artist searches with related acts and genre terms"
+reasoning: "User requested industrial metal. I will bridge this by suggesting industrial acts with strong traditional metal roots, plus deep cuts from the Neue Deutsche Härte scene and related underground acts. Seed artists will help Spotify find adjacent modern industrial acts."
 queries: [
   "Rammstein",
-  "Nine Inch Nails",
-  "Ministry industrial",
-  "KMFDM",
-  "Marilyn Manson",
+  "Oomph! metal",
   "neue deutsche haerte",
-  "Godflesh",
-  "Oomph! metal"
+  "Eisbrecher",
+  "Meganoidi",
+  "Deathstars",
+  "industrial metal underground"
 ]
+seed_artists: ["Oomph!", "Deathstars", "Meganoidi"]
 queue_size: 50
-
-Request: "sad acoustic songs"
-reasoning: "Well-known sad acoustic artists first, then broaden to genre terms"
-queries: [
-  "Elliott Smith",
-  "Nick Drake",
-  "Iron & Wine acoustic",
-  "Sufjan Stevens sad",
-  "Damien Rice",
-  "Bon Iver acoustic",
-  "sad folk acoustic indie"
-]
-queue_size: 30
-
---- OST / SOUNDTRACK MODE ---
-For any request involving game soundtracks, film scores, or TV scores:
-  - Set search_mode to "album"
-  - Your queries are ALBUM TITLES, not track searches
-  - The app will search for these albums on Spotify and pull all their tracks directly
-  - This bypasses keyword matching entirely and guarantees correct results
-  - Name every relevant album separately — expansions, volumes, special editions
-  - Also include the composer name as a standalone query (finds any loose tracks/singles)
-  - Do NOT use field operators in album mode — just the plain album title
-
-Request: "play the soundtrack from destiny 1 and 2"
-reasoning: "OST request — use album mode. Destiny 1 composer: Martin O'Donnell & Michael Salvatori. Destiny 2 has multiple expansion OSTs each released as separate albums. Searching album titles directly guarantees we get the actual soundtrack tracks."
-queries: [
-  "Destiny Original Soundtrack",
-  "Destiny 2 Original Soundtrack",
-  "Destiny 2 Forsaken Original Soundtrack",
-  "Destiny 2 Shadowkeep Original Soundtrack",
-  "Destiny 2 Beyond Light Original Soundtrack",
-  "Destiny 2 The Witch Queen Original Soundtrack",
-  "Destiny 2 Lightfall Original Soundtrack",
-  "Martin O'Donnell Michael Salvatori"
-]
-queue_size: 60
-search_mode: "album"
-
-Request: "Hans Zimmer Interstellar and Inception"
-reasoning: "OST request — album mode. Both are major film scores with dedicated soundtrack albums on Spotify."
-queries: [
-  "Interstellar Original Motion Picture Soundtrack",
-  "Inception Original Motion Picture Soundtrack",
-  "Hans Zimmer"
-]
-queue_size: 50
-search_mode: "album"
-
-Request: "final fantasy 7 remake ost"
-reasoning: "OST request — album mode. FF7 Remake has multiple soundtrack volumes. Nobuo Uematsu composed the original; Masashi Hamauzu and others did the remake."
-queries: [
-  "Final Fantasy VII Remake Original Soundtrack",
-  "Final Fantasy VII Remake Intergrade Original Soundtrack",
-  "Final Fantasy VII Original Soundtrack",
-  "Nobuo Uematsu Final Fantasy VII"
-]
-queue_size: 55
-search_mode: "album"
+search_mode: "track"
 
 Request: "japanese city pop 80s"
-reasoning: "City pop is a defined Japanese genre with known artists — use both Japanese script and romanized names"
+reasoning: "City pop is a defined Japanese genre. I will use both Japanese script and romanized names, focusing on both well-known and deeper-cut artists to ensure discovery."
 queries: [
   "山下達郎",
   "竹内まりや",
@@ -232,48 +178,61 @@ queries: [
   "Toshiki Kadomatsu",
   "80s Japanese pop"
 ]
+seed_artists: ["Miki Matsubara", "Anri", "Toshiki Kadomatsu"]
 queue_size: 45
+search_mode: "track"
 
 ---
 Output JSON only. No markdown, no explanation outside the JSON.
 The JSON must have exactly these fields:
-  "reasoning":   string  (explain what genre/scene you identified and your strategy)
+  "reasoning":   string
   "queries":     array of strings
   "queue_size":  integer
-  "search_mode": string  ("track" for normal requests, "album" for OSTs/soundtracks/scores)
+  "search_mode": string  ("track" or "album")
+  "seed_artists": array of strings (3-5 real, somewhat niche artists for Spotify's related-artist API)
 """
 
 CONTINUE_PROMPT = """
 You are an expert music curator. The user is extending their current listening
-session and wants MORE music in the same vibe — but with fresh tracks they
-haven't heard yet in this session.
+session and wants MORE music in the same vibe — but with fresh tracks and NEW 
+artists they haven't heard yet in this session, ideally ones they would never 
+normally have discovered.
 
 Original request: "{user_prompt}"
 
 Queries already used (DO NOT repeat these — find new angles):
 {previous_queries}
 
+Currently playing/queued tracks:
+{queue_tracks}
+
+{playlist_context_block}
+
 ---
 YOUR JOB:
-Generate 6-10 NEW search queries that explore DIFFERENT angles from those
-already used, while staying true to the original vibe. Think of this as
-going deeper into the genre or sideways into related territory.
+Generate 6-10 NEW search queries and 3-5 seed artists that explore DIFFERENT 
+angles from those already used, while staying true to the original vibe. 
 
-Good strategies for finding new angles:
-  - Artists similar to ones already searched but not yet used
+Good strategies for finding new angles & deep discovery:
+  - Artists similar to ones already searched but not yet used (use seed_artists)
   - A different era of the same genre (e.g. 80s vs 90s vs modern)
-  - A related subgenre not yet explored
+  - A related subgenre not yet explored (micro-genres, underground scenes)
   - Less mainstream / deeper cuts, B-sides, regional labels
   - Cross-genre fusion (e.g. "jazz metal", "electronic punk")
   - For non-English genres: try different script variants not yet used
-    (e.g. if Cyrillic was used, try transliterated; or vice versa)
   - Regional variations within the same tradition
   - Compilations or anthology searches ("best of X", "X collection")
+
+PLAYLIST INFLUENCE (If provided):
+  - Use the user's existing taste to make a lateral move. If the current session 
+    is drifting, gently pull it back toward an unexplored corner of the user's 
+    broader taste.
 
 SAME RULES APPLY:
   - Prefer real artist names over abstract descriptors
   - Be specific — vague queries return poor results
-  - Think about what's actually on Spotify
+  - Provide 3-5 `seed_artists` so the system can query Spotify's "Related Artists" 
+    API to find brand new artists outside your training data.
 
 Queue size: 40 tracks.
 
@@ -282,6 +241,7 @@ The JSON must have exactly these fields:
   "reasoning": string
   "queries": array of strings
   "queue_size": integer
+  "seed_artists": array of strings
 """
 
 STOPWORDS = {
@@ -297,6 +257,10 @@ class DJDirectives(BaseModel):
     queries:     list[str] = Field(default_factory=list)
     queue_size:  int = 40
     search_mode: str = "track"   # "track" (default) or "album" (for OSTs/scores)
+    seed_artists: list[str] = Field(
+        default_factory=list, 
+        description="3-5 real, somewhat niche artists to use as seeds for Spotify's 'related artists' API. This helps discover new artists beyond the LLM's memory."
+    )
 
 
 def _keyword_fallback(user_prompt: str) -> DJDirectives:
@@ -335,6 +299,8 @@ def _parse_local_response(text: str) -> DJDirectives | None:
             reasoning=data.get("reasoning", "Local LLM response"),
             queries=data.get("queries", []),
             queue_size=int(data.get("queue_size", 40)),
+            search_mode=data.get("search_mode", "track"),
+            seed_artists=data.get("seed_artists", []),
         )
         if not d.queries:
             return None
@@ -446,8 +412,8 @@ You are an expert music curator powering a Spotify AI DJ.
 
 The user has a Spotify playlist they love. Your job is to analyse the artists
 and tracks in that playlist and generate search queries that will find MORE
-music with a similar vibe — music that would fit right in alongside what's
-already there.
+music with a similar vibe — specifically focusing on NEW artists the user would
+never normally have discovered, including those outside your typical training data.
 
 User's extra instructions: "{user_prompt}"
 
@@ -459,20 +425,27 @@ YOUR TASK:
 1. Identify the genre(s), mood, scene, era, and cultural context of this playlist
 2. Identify the KEY ARTISTS that define the playlist's sound
 3. Generate 8-12 search queries that will find similar music NOT already in the playlist
+4. Provide 3-5 "seed artists" in the `seed_artists` field. These should be real, 
+   somewhat niche artists in this vibe. The system will use Spotify's "Related 
+   Artists" API on these seeds to discover brand new artists outside your memory.
 
-STRATEGIES:
+STRATEGIES FOR DEEP DISCOVERY:
 - Search for artists who are similar to but distinct from the playlist artists
 - Search for the genre/scene/era more broadly to catch artists you might not know
-- Include non-English queries if the playlist has non-English content
+- Include non-English queries if the playlist has non-English content (original script + transliteration)
 - Think about: same genre different era, same era different genre, same cultural
   scene, artists who often appear on the same compilations, collaborative artists
-- If the user gave extra instructions, weight those heavily
+- Micro-genres, underground labels, regional variations
 
 CRITICAL: Be specific. Real artist names and known genre terms outperform
 abstract descriptors on Spotify search.
 
 Output JSON only. No markdown, no explanation outside the JSON.
-Fields: "reasoning" (string), "queries" (array of strings), "queue_size" (integer, 40-80)
+Fields: 
+  "reasoning" (string)
+  "queries" (array of strings)
+  "queue_size" (integer, 40-80)
+  "seed_artists" (array of 3-5 strings)
 """
 
 
@@ -486,8 +459,6 @@ def get_playlist_vibe_params(
     Analyse a playlist's contents and generate queries for similar music.
     playlist_tracks: raw track dicts from Spotify (must have 'name' and 'artists').
     """
-    # Build a compact track list for the prompt (cap at 30 to stay within context)
-    import random
     sample = list(playlist_tracks)
     random.shuffle(sample)
     sample = sample[:30]
@@ -499,7 +470,7 @@ def get_playlist_vibe_params(
     track_list = "\n".join(lines)
 
     prompt = PLAYLIST_PROMPT.format(
-        user_prompt=user_prompt or "Find music that fits alongside these tracks.",
+        user_prompt=user_prompt or "Find music that fits alongside these tracks, focusing on deep discovery and new artists.",
         track_list=track_list,
     )
 
@@ -519,16 +490,37 @@ def get_playlist_vibe_params(
         reasoning="AI unavailable. Falling back to searching for playlist artists directly.",
         queries=fallback_queries,
         queue_size=50,
+        seed_artists=artists[:5],
     )
 
 
-def get_vibe_params(user_prompt: str, api_key: str, local_only: bool = False) -> DJDirectives:
-    """Convert a fresh music request into search queries."""
-    prefs   = load_preferences()
+def get_vibe_params(
+    user_prompt: str, 
+    api_key: str, 
+    local_only: bool = False,
+    playlist_context: list[str] | str | None = None
+) -> DJDirectives:
+    """
+    Convert a fresh music request into search queries.
+    playlist_context: Optional list or string of user's playlist artists/genres 
+                      to influence lateral discovery.
+    """
+    prefs = load_preferences()
     pref_ctx = build_preference_context(prefs)
-    prompt  = INITIAL_PROMPT.format(
+    
+    if playlist_context:
+        if isinstance(playlist_context, list):
+            ctx_str = ", ".join(playlist_context[:15])  # Top 15 artists/genres
+        else:
+            ctx_str = playlist_context
+        playlist_block = f"User's Existing Taste (Use as a launching pad for lateral discovery, NOT to repeat): {ctx_str}"
+    else:
+        playlist_block = ""
+
+    prompt = INITIAL_PROMPT.format(
         user_prompt=user_prompt,
         preference_context=pref_ctx,
+        playlist_context_block=playlist_block,
     )
     result = _call_ai(prompt, api_key, local_only=local_only)
     if result:
@@ -546,12 +538,12 @@ def get_continue_params(
     api_key: str,
     local_only: bool = False,
     queue_tracks: list[dict] | None = None,
+    playlist_context: list[str] | str | None = None,
 ) -> DJDirectives:
     """
     Generate fresh queries to extend an existing session.
     queue_tracks: list of {name, artist} dicts from the current Spotify queue.
-    When provided, the AI uses the actual queued tracks to find better matches
-    rather than relying solely on the original request text.
+    playlist_context: list or string of user's playlist artists/genres to influence lateral discovery.
     """
     formatted_queries = "\n".join(f"  - {q}" for q in previous_queries)
 
@@ -562,10 +554,20 @@ def get_continue_params(
     else:
         formatted_queue = "  (no queue data available — go by original request)"
 
+    if playlist_context:
+        if isinstance(playlist_context, list):
+            ctx_str = ", ".join(playlist_context[:15])
+        else:
+            ctx_str = playlist_context
+        playlist_block = f"User's Existing Taste (Use for lateral discovery): {ctx_str}"
+    else:
+        playlist_block = ""
+
     prompt = CONTINUE_PROMPT.format(
         user_prompt=original_prompt,
         previous_queries=formatted_queries,
         queue_tracks=formatted_queue,
+        playlist_context_block=playlist_block,
     )
     result = _call_ai(prompt, api_key, local_only=local_only)
     if result:
